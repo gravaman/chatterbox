@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	// "bufio"
 	"bytes"
 	"encoding/json"
 	"flag"
@@ -11,12 +11,17 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/marcusolsson/tui-go"
 )
 
 const (
 	DEFAULT_PORT = 8000
 )
+
+var history *tui.Box
 
 // Opts encapsulates cli options.
 type Opts struct {
@@ -67,6 +72,7 @@ func printStage(s Stage) {
 type Msg struct {
 	Txt  string
 	User Peer
+	Time time.Time
 }
 
 // Peer represents a chat user.
@@ -89,37 +95,43 @@ type P2PNet struct {
 
 // Start launches the event loop, user listener, and net listener.
 // A peer join event is optionally triggered depending on the cli input.
-func (n *P2PNet) Start() {
-	go n.eventLoop()
+func (n *P2PNet) Start(sbv *sidebarView, ui tui.UI) {
+	go n.eventLoop(sbv, ui)
 	go n.netListener()
 	if *opts.peer != "" {
 		n.peerJoin <- Peer{Addr: *opts.peer}
 	}
-	n.userListener()
 }
 
 // eventLoop handles user and network io events.
-func (n *P2PNet) eventLoop() {
+func (n *P2PNet) eventLoop(sbv *sidebarView, ui tui.UI) {
 	if *opts.debug {
 		printStage(EventLoop)
 	}
-	// [TBU: close event]
 	for {
 		select {
 		case peer := <-n.peerJoin:
 			if !n.knownPeer(peer) {
-				fmt.Printf("# Connected to: %s\n", peer.Addr)
-				n.Peers[peer.Addr] = peer
-				go n.sendJoin(peer)
+				go n.sendJoin(sbv, peer)
 			}
 		case <-n.getCurrentPeers:
 			n.peersCurrent <- n.Peers
 		case peer := <-n.peerLeft:
 			delete(n.Peers, peer.Addr)
+			history.Append(tui.NewHBox(
+				tui.NewLabel(fmt.Sprintf("# <%s> <%s> (%s) has left the chat", peer.Name, peer.Addr)),
+				tui.NewSpacer(),
+			))
+			sbv.removePeep(peer)
 		case m := <-n.rcvMsg:
-			fmt.Printf("[%s] %s\n", m.User.Name, m.Txt)
+			history.Append(tui.NewHBox(
+				tui.NewLabel(m.Time.Format("15:04")),
+				tui.NewPadder(1, 0, tui.NewLabel(fmt.Sprintf("<%s>", m.User.Name))),
+				tui.NewLabel(m.Txt),
+				tui.NewSpacer(),
+			))
+			ui.Repaint()
 		case m := <-n.userMsg:
-			fmt.Printf("[%s] %s\n", m.User.Name, m.Txt)
 			for _, peer := range n.Peers {
 				go n.sendChat(peer, m)
 			}
@@ -127,10 +139,15 @@ func (n *P2PNet) eventLoop() {
 	}
 }
 
+type JoinRes struct {
+	*Peer
+	Others Peers
+}
+
 // sendJoin sends a join request to the given peer. If the req errors
 // the peer is assumed to have left. Each peer included in a successful
 // response is directed to the event loop for subsequent join requests.
-func (n *P2PNet) sendJoin(peer Peer) {
+func (n *P2PNet) sendJoin(sbv *sidebarView, peer Peer) {
 	URL := "http://" + peer.Addr + "/join"
 	var b *bytes.Buffer
 	if qs, err := json.Marshal(n.Self); err != nil {
@@ -146,14 +163,26 @@ func (n *P2PNet) sendJoin(peer Peer) {
 	}
 	defer res.Body.Close()
 
-	n.peerJoin <- peer // why is this here?
-	others := make(Peers)
+	joinRes := new(JoinRes)
 	dec := json.NewDecoder(res.Body)
-	if err := dec.Decode(&others); err != nil {
+	if err := dec.Decode(&joinRes); err != nil {
 		log.Fatal(err)
 	}
+	if peer.Name == "" {
+		peer.Name = joinRes.Name
+	}
 
-	for _, other := range others {
+	if peer.Name != n.Self.Name {
+		sbv.addPeep(peer)
+		history.Append(tui.NewHBox(
+			tui.NewLabel(fmt.Sprintf("# <%s> (%s) has joined the chat", peer.Name, peer.Addr)),
+			tui.NewSpacer(),
+		))
+		n.Peers[peer.Addr] = peer
+		n.peerJoin <- peer
+	}
+
+	for _, other := range joinRes.Others {
 		n.peerJoin <- other
 	}
 }
@@ -218,36 +247,40 @@ func joinHandler(n *P2PNet) func(http.ResponseWriter, *http.Request) {
 		if err != nil {
 			fmt.Errorf("Error unmarshalling join request from: %v", err)
 		}
+		if peer.Name == "" {
+			fmt.Println("JOIN HANDLER PEER.NAME:", peer.Name)
+			peer.Name = n.Self.Name
+			fmt.Println("JOIN HANDLER SELF.NAME:", n.Self.Name)
+		}
 		n.peerJoin <- *peer
 		n.getCurrentPeers <- true
 
 		enc := json.NewEncoder(w)
-		enc.Encode(<-n.peersCurrent)
+		joinRes := JoinRes{
+			Peer:   peer,
+			Others: <-n.peersCurrent,
+		}
+		enc.Encode(joinRes)
 	}
 }
 
 // userListener reads stdin user input and sends to event loop.
-func (n *P2PNet) userListener() {
-	if *opts.debug {
-		printStage(UserListener)
-	}
-	var l string
-	var err error
-	r := bufio.NewReader(os.Stdin)
-	for {
-		l, err = r.ReadString('\n')
-		if err != nil {
-			log.Fatal(err)
+func (n *P2PNet) userListener(input *tui.Entry) {
+	input.OnSubmit(func(entry *tui.Entry) {
+		m := Msg{
+			User: n.Self,
+			Txt:  entry.Text(),
+			Time: time.Now(),
 		}
-
-		if l != "" {
-			n.userMsg <- Msg{l[:len(l)-1], n.Self}
-			l = ""
-		} else {
-			time.Sleep(time.Second)
-		}
-
-	}
+		history.Append(tui.NewHBox(
+			tui.NewLabel(m.Time.Format("15:04")),
+			tui.NewPadder(1, 0, tui.NewLabel(fmt.Sprintf("<%s>", m.User.Name))),
+			tui.NewLabel(m.Txt),
+			tui.NewSpacer(),
+		))
+		input.SetText("")
+		n.userMsg <- m
+	})
 }
 
 // NewP2PNet initializes a new p2p network with given seed peer.
@@ -266,6 +299,14 @@ func NewP2PNet(self Peer) *P2PNet {
 
 // Peers is a map of current Peers with address for key.
 type Peers map[string]Peer
+
+func (ps *Peers) peerNames() []string {
+	var pnames []string
+	for _, peer := range map[string]Peer(*ps) {
+		pnames = append(pnames, peer.Name)
+	}
+	return pnames
+}
 
 func localIP4() string {
 	host, err := os.Hostname()
@@ -294,7 +335,58 @@ func servicePort() string {
 	return strconv.Itoa(DEFAULT_PORT)
 }
 
+type sidebarView struct {
+	tLabel *tui.Label
+	pLabel *tui.Label
+	pnames []string
+
+	*tui.Box
+}
+
+func (sbv *sidebarView) removePeep(peer Peer) {
+	var found bool
+	var idx int
+	for i, name := range sbv.pnames {
+		if name == peer.Name {
+			found = true
+			idx = i
+			break
+		}
+	}
+	if found {
+		sbv.pnames = append(sbv.pnames[:idx], sbv.pnames[idx+1:]...)
+		sbv.pLabel.SetText(strings.Join(sbv.pnames, "\n"))
+	}
+}
+
+func (sbv *sidebarView) addPeep(peer Peer) {
+	if peer.Name == "" {
+		return
+	}
+	sbv.pnames = append(sbv.pnames, peer.Name)
+	sbv.pLabel.SetText(strings.Join(sbv.pnames, "\n"))
+}
+
+func newSidebarView(title string, peers Peers) *sidebarView {
+	pnames := peers.peerNames()
+	pLabel := tui.NewLabel(strings.Join(pnames, "\n"))
+	tLabel := tui.NewLabel(title)
+	v := &sidebarView{
+		tLabel: tLabel,
+		pLabel: pLabel,
+		pnames: pnames,
+	}
+	v.Box = tui.NewVBox(
+		tLabel,
+		pLabel,
+		tui.NewSpacer(),
+	)
+	v.Box.SetBorder(true)
+	return v
+}
+
 func main() {
+	// handle cli opts
 	flag.Parse()
 
 	if *opts.debug {
@@ -306,9 +398,52 @@ func main() {
 		fmt.Printf("\nChatterBox Usage\n")
 		flag.PrintDefaults()
 		fmt.Println()
+		os.Exit(0)
 	}
 
+	// network  setup
 	me := Peer{*opts.name, localIP4() + ":" + servicePort()}
 	n := NewP2PNet(me)
-	n.Start()
+
+	// tui setup
+	sbv := newSidebarView("PEEPS", n.Peers)
+
+	history = tui.NewVBox()
+	historyScroll := tui.NewScrollArea(history)
+	historyScroll.SetAutoscrollToBottom(true)
+
+	historyBox := tui.NewVBox(historyScroll)
+	historyBox.SetBorder(true)
+
+	input := tui.NewEntry()
+	input.SetFocused(true)
+	input.SetSizePolicy(tui.Expanding, tui.Maximum)
+
+	// user input setup
+	n.userListener(input)
+
+	inputBox := tui.NewHBox(input)
+	inputBox.SetBorder(true)
+	inputBox.SetSizePolicy(tui.Expanding, tui.Maximum)
+
+	// launch tui
+	chat := tui.NewVBox(historyBox, inputBox)
+	chat.SetSizePolicy(tui.Expanding, tui.Expanding)
+
+	root := tui.NewHBox(sbv.Box, chat)
+
+	ui, err := tui.New(root)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	ui.SetKeybinding("Esc", func() { ui.Quit() })
+
+	// launch app
+	n.Start(sbv, ui)
+
+	// launch tui
+	if err := ui.Run(); err != nil {
+		log.Fatal(err)
+	}
 }
