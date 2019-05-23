@@ -1,7 +1,6 @@
 package main
 
 import (
-	// "bufio"
 	"bytes"
 	"encoding/json"
 	"flag"
@@ -112,17 +111,22 @@ func (n *P2PNet) eventLoop(sbv *sidebarView, ui tui.UI) {
 		select {
 		case peer := <-n.peerJoin:
 			if !n.knownPeer(peer) {
-				go n.sendJoin(sbv, peer)
+				go n.sendJoin(sbv, peer, ui)
 			}
 		case <-n.getCurrentPeers:
 			n.peersCurrent <- n.Peers
 		case peer := <-n.peerLeft:
 			delete(n.Peers, peer.Addr)
-			history.Append(tui.NewHBox(
-				tui.NewLabel(fmt.Sprintf("# <%s> <%s> (%s) has left the chat", peer.Name, peer.Addr)),
-				tui.NewSpacer(),
-			))
 			sbv.removePeep(peer)
+			if peer.Name != n.Self.Name {
+				history.Append(tui.NewHBox(
+					tui.NewLabel(fmt.Sprintf("# <%s> (%s) has left the chat", peer.Name, peer.Addr)),
+					tui.NewSpacer(),
+				))
+				ui.Repaint()
+			} else {
+				go n.sendLeft(peer)
+			}
 		case m := <-n.rcvMsg:
 			history.Append(tui.NewHBox(
 				tui.NewLabel(m.Time.Format("15:04")),
@@ -147,7 +151,7 @@ type JoinRes struct {
 // sendJoin sends a join request to the given peer. If the req errors
 // the peer is assumed to have left. Each peer included in a successful
 // response is directed to the event loop for subsequent join requests.
-func (n *P2PNet) sendJoin(sbv *sidebarView, peer Peer) {
+func (n *P2PNet) sendJoin(sbv *sidebarView, peer Peer, ui tui.UI) {
 	URL := "http://" + peer.Addr + "/join"
 	var b *bytes.Buffer
 	if qs, err := json.Marshal(n.Self); err != nil {
@@ -178,12 +182,31 @@ func (n *P2PNet) sendJoin(sbv *sidebarView, peer Peer) {
 			tui.NewLabel(fmt.Sprintf("# <%s> (%s) has joined the chat", peer.Name, peer.Addr)),
 			tui.NewSpacer(),
 		))
+		ui.Repaint()
 		n.Peers[peer.Addr] = peer
 		n.peerJoin <- peer
 	}
 
 	for _, other := range joinRes.Others {
 		n.peerJoin <- other
+	}
+}
+
+func (n *P2PNet) sendLeft(peer Peer) {
+	for _, other := range n.Peers {
+		URL := "http://" + other.Addr + "/left"
+		var b *bytes.Buffer
+		if qs, err := json.Marshal(other); err != nil {
+			log.Fatal(err)
+		} else {
+			b = bytes.NewBuffer(qs)
+		}
+
+		_, err := http.Post(URL, "application/json", b)
+		if err != nil {
+			n.peerLeft <- other
+			return
+		}
 	}
 }
 
@@ -216,6 +239,7 @@ func (n *P2PNet) knownPeer(peer Peer) bool {
 func (n *P2PNet) netListener() {
 	http.HandleFunc("/chat", chatHandler(n))
 	http.HandleFunc("/join", joinHandler(n))
+	http.HandleFunc("/left", leftHandler(n))
 
 	if *opts.debug {
 		printStage(NetListener)
@@ -261,6 +285,18 @@ func joinHandler(n *P2PNet) func(http.ResponseWriter, *http.Request) {
 			Others: <-n.peersCurrent,
 		}
 		enc.Encode(joinRes)
+	}
+}
+
+func leftHandler(n *P2PNet) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		peer := new(Peer)
+		dec := json.NewDecoder(r.Body)
+		err := dec.Decode(&peer)
+		if err != nil {
+			log.Fatal(err)
+		}
+		n.peerLeft <- *peer
 	}
 }
 
@@ -437,7 +473,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ui.SetKeybinding("Esc", func() { ui.Quit() })
+	ui.SetKeybinding("Esc", func() {
+		n.peerLeft <- me
+		ui.Quit()
+	})
 
 	// launch app
 	n.Start(sbv, ui)
